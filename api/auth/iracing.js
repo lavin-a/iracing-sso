@@ -24,9 +24,19 @@ const axios = require('axios');
 
 module.exports = async (req, res) => {
   // Enable CORS for your Framer site
-  res.setHeader('Access-Control-Allow-Origin', '*'); // Or specific domain
+  const allowedOrigins = [
+    'https://aware-amount-178968.framer.app',
+    'https://almeidaracingacademy.com',
+  ];
+  
+  const origin = req.headers.origin;
+  if (allowedOrigins.includes(origin) || origin?.endsWith('.framer.app')) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  }
+  
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
 
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
@@ -75,7 +85,31 @@ function handleStart(req, res) {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async function handleCallback(req, res) {
-  const { code } = req.query;
+  const { code, error, error_description } = req.query;
+
+  // Handle OAuth errors from iRacing
+  if (error) {
+    console.error('iRacing OAuth error:', error, error_description);
+    return res.send(`
+      <!DOCTYPE html>
+      <html>
+        <head><title>Authentication Failed</title></head>
+        <body>
+          <script>
+            if (window.opener) {
+              window.opener.postMessage({
+                type: 'IRACING_AUTH_ERROR',
+                error: '${error}',
+                description: '${error_description || 'Authentication failed'}'
+              }, '*');
+              window.close();
+            }
+          </script>
+          <p>Authentication failed. You can close this window.</p>
+        </body>
+      </html>
+    `);
+  }
 
   if (!code) {
     return res.status(400).send('Missing authorization code');
@@ -109,12 +143,17 @@ async function handleCallback(req, res) {
   );
 
   const iRacingUser = userInfoResponse.data;
+  console.log('✓ iRacing user authenticated:', iRacingUser.email);
 
   // 3. Find or create Outseta user
   const outsetaUser = await findOrCreateOutsetaUser(iRacingUser);
 
   // 4. Generate Outseta JWT access token
   const outsetaAccessToken = await generateOutsetaToken(outsetaUser);
+  
+  if (!outsetaAccessToken) {
+    throw new Error('Failed to generate Outseta token');
+  }
 
   // 5. Close popup and send token to opener window
   res.send(`
@@ -130,7 +169,7 @@ async function handleCallback(req, res) {
             justify-content: center;
             height: 100vh;
             margin: 0;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #c8102e 0%, #1a428a 100%);
             color: white;
           }
           .container {
@@ -219,16 +258,14 @@ async function handleExchange(req, res) {
 
 async function findOrCreateOutsetaUser(iRacingUser) {
   const outsetaApiUrl = `https://${process.env.OUTSETA_DOMAIN}/api/v1`;
-  const auth = Buffer.from(
-    `${process.env.OUTSETA_API_KEY}:${process.env.OUTSETA_SECRET_KEY}`
-  ).toString('base64');
+  const auth = `${process.env.OUTSETA_API_KEY}:${process.env.OUTSETA_SECRET_KEY}`;
 
   // Try to find existing user
   try {
     const searchResponse = await axios.get(
       `${outsetaApiUrl}/crm/people`,
       {
-        headers: { Authorization: `Basic ${auth}` },
+        headers: { Authorization: `Outseta ${auth}` },
         params: { Email: iRacingUser.email },
       }
     );
@@ -257,7 +294,7 @@ async function findOrCreateOutsetaUser(iRacingUser) {
     },
     {
       headers: {
-        Authorization: `Basic ${auth}`,
+        Authorization: `Outseta ${auth}`,
         'Content-Type': 'application/json',
       },
     }
@@ -272,25 +309,32 @@ async function findOrCreateOutsetaUser(iRacingUser) {
 
 async function generateOutsetaToken(outsetaUser) {
   const outsetaApiUrl = `https://${process.env.OUTSETA_DOMAIN}/api/v1`;
-  const auth = Buffer.from(
-    `${process.env.OUTSETA_API_KEY}:${process.env.OUTSETA_SECRET_KEY}`
-  ).toString('base64');
+  const auth = `${process.env.OUTSETA_API_KEY}:${process.env.OUTSETA_SECRET_KEY}`;
 
+  // Generate JWT token using server-side authentication
+  // Docs: https://go.outseta.com/support/kb/articles/e6pXX9OL/generate-jwt-access-tokens-aka-log-in-users-using-the-outseta-api
   const tokenResponse = await axios.post(
-    `${outsetaApiUrl}/auth/token`,
-    {
-      Email: outsetaUser.Email,
-    },
+    `${outsetaApiUrl}/tokens`,
+    {},  // Empty body for server-side auth
     {
       headers: {
-        Authorization: `Basic ${auth}`,
+        Authorization: `Outseta ${auth}`,
         'Content-Type': 'application/json',
       },
+      params: {
+        email: outsetaUser.Email,  // Pass email as query param
+      }
     }
   );
 
+  const token = tokenResponse.data.access_token || tokenResponse.data;
   console.log('✓ Generated Outseta token for:', outsetaUser.Email);
-  return tokenResponse.data.access_token;
+  
+  if (!token) {
+    throw new Error('Outseta token generation returned empty response');
+  }
+  
+  return token;
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

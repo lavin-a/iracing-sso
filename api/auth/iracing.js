@@ -1,4 +1,5 @@
 const axios = require('axios');
+const crypto = require('crypto');
 
 const allowedOrigins = [
   'https://aware-amount-178968.framer.app',
@@ -6,6 +7,9 @@ const allowedOrigins = [
   'https://www.almeidaracingacademy.com',
   'https://almeidaracingacademy.outseta.com',
 ];
+
+// In-memory store for PKCE verifiers (in production, use Redis or similar)
+const pkceStore = new Map();
 
 module.exports = async (req, res) => {
   const origin = req.headers.origin;
@@ -36,13 +40,31 @@ function handleStart(req, res) {
 
   const redirectUri = `${getBaseUrl(req)}/api/auth/iracing`;
 
+  // Generate PKCE code_verifier and code_challenge
+  // https://oauth.iracing.com/oauth2/book/pkce_overview.html
+  const codeVerifier = crypto.randomBytes(32).toString('base64url');
+  const codeChallenge = crypto
+    .createHash('sha256')
+    .update(codeVerifier)
+    .digest('base64url');
+
+  // Generate a state parameter to link the verifier to the callback
+  const state = crypto.randomBytes(16).toString('hex');
+  
+  // Store the verifier for the callback (expires in 10 minutes)
+  pkceStore.set(state, codeVerifier);
+  setTimeout(() => pkceStore.delete(state), 10 * 60 * 1000);
+
+  // Using new OAuth endpoints: https://oauth.iracing.com/oauth2/book/authorize_endpoint.html
   const url =
-    'https://members.iracing.com/membersite/oauth2/authorize' +
+    'https://oauth.iracing.com/oauth2/authorize' +
     `?client_id=${encodeURIComponent(process.env.IRACING_CLIENT_ID)}` +
     `&redirect_uri=${encodeURIComponent(redirectUri)}` +
     `&response_type=code` +
-    `&scope=openid%20profile%20email` +
-    `&prompt=none`;
+    `&scope=iracing.auth` +
+    `&code_challenge=${encodeURIComponent(codeChallenge)}` +
+    `&code_challenge_method=S256` +
+    `&state=${encodeURIComponent(state)}`;
 
   res.writeHead(302, { Location: url });
   res.end();
@@ -50,22 +72,46 @@ function handleStart(req, res) {
 
 async function handleCallback(req, res, code) {
   if (req.query.error) {
-    console.error('iRacing OAuth error:', req.query.error);
+    console.error('iRacing OAuth error:', req.query.error, req.query.error_description);
     return res.send(renderErrorPage('iRacing authentication failed.'));
   }
 
   try {
     const redirectUri = `${getBaseUrl(req)}/api/auth/iracing`;
+    const state = req.query.state;
+
+    // Retrieve the PKCE code_verifier
+    const codeVerifier = pkceStore.get(state);
+    if (!codeVerifier) {
+      console.error('PKCE verifier not found for state:', state);
+      return res.send(renderErrorPage('Session expired. Please try again.'));
+    }
+
+    // Clean up the verifier
+    pkceStore.delete(state);
+
+    // Using new OAuth endpoints: https://oauth.iracing.com/oauth2/book/token_endpoint.html
+    // For Authorization Code Grant with PKCE, client_secret is "required only if issued"
+    const tokenParams = {
+      grant_type: 'authorization_code',
+      code,
+      client_id: process.env.IRACING_CLIENT_ID,
+      redirect_uri: redirectUri,
+      code_verifier: codeVerifier,
+    };
+
+    // If client_secret was issued, mask it with client_id before sending
+    if (process.env.IRACING_CLIENT_SECRET) {
+      console.log('Masking client secret with client_id');
+      tokenParams.client_secret = maskClientSecret(
+        process.env.IRACING_CLIENT_SECRET,
+        process.env.IRACING_CLIENT_ID
+      );
+    }
 
     const tokenResponse = await axios.post(
-      'https://members.iracing.com/membersite/oauth2/token',
-      new URLSearchParams({
-        grant_type: 'authorization_code',
-        code,
-        client_id: process.env.IRACING_CLIENT_ID,
-        client_secret: process.env.IRACING_CLIENT_SECRET,
-        redirect_uri: redirectUri,
-      }),
+      'https://oauth.iracing.com/oauth2/token',
+      new URLSearchParams(tokenParams),
       {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         timeout: 8000,
@@ -74,12 +120,25 @@ async function handleCallback(req, res, code) {
 
     const iRacingAccessToken = tokenResponse.data.access_token;
 
-    const userResponse = await axios.get('https://members.iracing.com/membersite/oauth2/userinfo', {
-      headers: { Authorization: `Bearer ${iRacingAccessToken}` },
-      timeout: 8000,
-    });
+    // Decode JWT to get user info (iRacing includes user data in the token)
+    const tokenParts = iRacingAccessToken.split('.');
+    if (tokenParts.length !== 3) {
+      throw new Error('Invalid JWT token format');
+    }
+    
+    const payload = JSON.parse(Buffer.from(tokenParts[1], 'base64').toString('utf-8'));
+    console.log('iRacing token payload:', payload);
 
-    const iRacingUser = userResponse.data;
+    // Map iRacing token data to expected user format
+    const iRacingUser = {
+      sub: payload.sub || payload.cust_id,
+      email: payload.email,
+      given_name: payload.given_name || payload.first_name,
+      family_name: payload.family_name || payload.last_name,
+      preferred_username: payload.preferred_username || payload.display_name,
+      nickname: payload.nickname || payload.display_name,
+    };
+
     console.log('iRacing user:', iRacingUser.email);
 
     const outsetaPerson = await findOrCreateOutsetaUser(iRacingUser);
@@ -264,6 +323,16 @@ function getBaseUrl(req) {
   const protocol = req.headers['x-forwarded-proto'] || 'https';
   const host = req.headers['x-forwarded-host'] || req.headers.host;
   return `${protocol}://${host}`;
+}
+
+function maskClientSecret(secret, identifier) {
+  // iRacing requires client secrets to be masked using SHA-256
+  // https://oauth.iracing.com/oauth2/book/token_endpoint.html
+  // Format: SHA256(secret + normalized_identifier) in base64
+  const normalizedId = identifier.trim().toLowerCase();
+  const combined = secret + normalizedId;
+  const hash = crypto.createHash('sha256').update(combined).digest('base64');
+  return hash;
 }
 
 function dumpError(tag, error) {

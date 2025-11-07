@@ -12,28 +12,6 @@ const allowedOrigins = [
 // In-memory store for PKCE verifiers (in production, use Redis or similar)
 const pkceStore = new Map();
 
-// In-memory store for temporary OAuth data (in production, use Redis or similar)
-const tempDataStore = new Map();
-const TOKEN_TTL_MS = 5 * 60 * 1000;
-
-function storeTokenForClient(clientState, token) {
-  if (!clientState || !token) {
-    return;
-  }
-
-  tempDataStore.set(clientState, {
-    token,
-    createdAt: Date.now(),
-  });
-
-  setTimeout(() => {
-    const entry = tempDataStore.get(clientState);
-    if (entry && Date.now() - entry.createdAt >= TOKEN_TTL_MS) {
-      tempDataStore.delete(clientState);
-    }
-  }, TOKEN_TTL_MS);
-}
-
 module.exports = async (req, res) => {
   const origin = req.headers.origin;
   if (allowedOrigins.includes(origin) || origin?.endsWith('.framer.app')) {
@@ -49,13 +27,8 @@ module.exports = async (req, res) => {
 
   const { code, action } = req.query;
 
-  // Handle complete-registration endpoint (POST)
   if (req.method === 'POST' && action === 'complete-registration') {
     return handleCompleteRegistration(req, res);
-  }
-
-  if (req.method === 'GET' && action === 'poll') {
-    return handlePoll(req, res);
   }
 
   if (!code) {
@@ -70,11 +43,11 @@ function handleStart(req, res) {
     return res.status(500).send('iRacing client ID not configured');
   }
 
-  const clientState = req.query.clientState;
-  const emailPageUrl = req.query.emailPageUrl;
+  const returnUrl = req.query.return_url;
+  const emailPageUrl = req.query.email_page_url;
   
-  if (!clientState) {
-    return res.status(400).send('Missing client state');
+  if (!returnUrl) {
+    return res.status(400).send('Missing return_url parameter');
   }
 
   const redirectUri = `${getBaseUrl(req)}/api/auth/iracing`;
@@ -86,22 +59,16 @@ function handleStart(req, res) {
     .update(codeVerifier)
     .digest('base64url');
 
-  // Generate a state parameter that includes both PKCE state and client state
   const pkceState = crypto.randomBytes(16).toString('hex');
 
   pkceStore.set(pkceState, {
     codeVerifier,
-    clientState,
+    returnUrl,
     emailPageUrl,
     createdAt: Date.now(),
   });
   setTimeout(() => pkceStore.delete(pkceState), 10 * 60 * 1000);
 
-  const statePayload = Buffer.from(
-    JSON.stringify({ pkce: pkceState, client: clientState })
-  ).toString('base64url');
-
-  // Using new OAuth endpoints: https://oauth.iracing.com/oauth2/book/authorize_endpoint.html
   const url =
     'https://oauth.iracing.com/oauth2/authorize' +
     `?client_id=${encodeURIComponent(process.env.IRACING_CLIENT_ID)}` +
@@ -110,7 +77,7 @@ function handleStart(req, res) {
     `&scope=iracing.auth` +
     `&code_challenge=${encodeURIComponent(codeChallenge)}` +
     `&code_challenge_method=S256` +
-    `&state=${encodeURIComponent(statePayload)}` +
+    `&state=${encodeURIComponent(pkceState)}` +
     `&prompt=none`;
 
   res.writeHead(302, { Location: url });
@@ -125,41 +92,20 @@ async function handleCallback(req, res, code) {
 
   try {
     const redirectUri = `${getBaseUrl(req)}/api/auth/iracing`;
-    const rawState = req.query.state;
-
-    let stateData;
-    try {
-      stateData = JSON.parse(Buffer.from(rawState, 'base64url').toString('utf8'));
-    } catch (err) {
-      console.error('Unable to decode state parameter:', err.message);
-      return res.send(renderErrorPage('Invalid authentication state. Please try again.'));
-    }
-
-    const pkceState = stateData?.pkce;
-    const clientState = stateData?.client;
+    const pkceState = req.query.state;
 
     const pkceEntry = pkceStore.get(pkceState);
-    const codeVerifier = pkceEntry?.codeVerifier || pkceEntry;
-    const clientStateValue = pkceEntry?.clientState || clientState;
+    const codeVerifier = pkceEntry?.codeVerifier;
+    const returnUrl = pkceEntry?.returnUrl;
     const emailPageUrl = pkceEntry?.emailPageUrl;
     
-    if (!codeVerifier) {
+    if (!codeVerifier || !returnUrl) {
       console.error('PKCE verifier not found for state:', pkceState);
       return res.send(renderErrorPage('Session expired. Please try again.'));
     }
 
-    if (!clientStateValue) {
-      console.error('Missing client state during callback');
-      return res.send(renderErrorPage('Session expired. Please try again.'));
-    }
-
-    const clientStateResult = clientStateValue;
-
-    // Clean up the verifier entry
     pkceStore.delete(pkceState);
 
-    // Using new OAuth endpoints: https://oauth.iracing.com/oauth2/book/token_endpoint.html
-    // For Authorization Code Grant with PKCE, client_secret is "required only if issued"
     const tokenParams = {
       grant_type: 'authorization_code',
       code,
@@ -168,7 +114,6 @@ async function handleCallback(req, res, code) {
       code_verifier: codeVerifier,
     };
 
-    // If client_secret was issued, mask it with client_id before sending
     if (process.env.IRACING_CLIENT_SECRET) {
       tokenParams.client_secret = maskClientSecret(
         process.env.IRACING_CLIENT_SECRET,
@@ -187,32 +132,28 @@ async function handleCallback(req, res, code) {
 
     const iRacingAccessToken = tokenResponse.data.access_token;
 
-    // Decode JWT to get user info (iRacing includes user data in the token)
     const tokenParts = iRacingAccessToken.split('.');
     if (tokenParts.length !== 3) {
       throw new Error('Invalid JWT token format');
     }
     
     const payload = JSON.parse(Buffer.from(tokenParts[1], 'base64').toString('utf-8'));
-
-    // iRacing JWT only provides iracing_cust_id, no username/email
     const iRacingCustId = String(payload.iracing_cust_id || '');
 
     // Check if user already exists by iRacingId
     const existingUser = await findExistingUserByIRacingId(iRacingCustId);
     
     if (existingUser) {
-      // Existing user - auto-login (just like Discord)
+      // Existing user - auto-login
       const outsetaToken = await generateOutsetaToken(existingUser.Email);
-      storeTokenForClient(clientStateResult, outsetaToken);
-      return res.send(renderSuccessPage());
+      return res.send(renderSuccessPage(outsetaToken, returnUrl));
     }
 
-    // New user - need email (iRacing doesn't provide it)
+    // New user - need email
     const tempToken = jwt.sign(
       {
         iRacingCustId,
-        clientState: clientStateResult,
+        returnUrl,
         provider: 'iracing',
         firstName: payload.given_name || payload.first_name || 'iRacing',
         lastName: payload.family_name || payload.last_name || 'User',
@@ -221,9 +162,8 @@ async function handleCallback(req, res, code) {
       { expiresIn: '10m' }
     );
 
-    // Redirect to Framer page for email collection
-    const framerEmailPage = emailPageUrl;
-    return res.send(renderRedirectToFramer(framerEmailPage, tempToken));
+    // Redirect to Framer email collection page
+    return res.send(renderRedirectToFramer(emailPageUrl, tempToken));
   } catch (err) {
     dumpError('[iRacingSSO]', err);
     return res.send(renderErrorPage('Unable to complete iRacing sign in.'));
@@ -243,7 +183,6 @@ async function handleCompleteRegistration(req, res) {
       return res.status(400).json({ error: 'Name is required' });
     }
 
-    // Verify and decode the temporary token
     let oauthData;
     try {
       oauthData = jwt.verify(tempToken, process.env.TEMP_TOKEN_SECRET);
@@ -252,63 +191,34 @@ async function handleCompleteRegistration(req, res) {
       return res.status(400).json({ error: 'Invalid or expired token. Please try signing in again.' });
     }
 
-    // Validate email format
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(email)) {
       return res.status(400).json({ error: 'Invalid email format' });
     }
 
-    // Split name into first and last name
     const nameParts = name.trim().split(/\s+/);
     const firstName = nameParts[0] || 'iRacing';
     const lastName = nameParts.length > 1 ? nameParts.slice(1).join(' ') : 'User';
 
-    // Create user data object
     const userData = {
       email,
-      sub: oauthData.iRacingCustId, // Use customer ID (e.g., 1173000)
+      sub: oauthData.iRacingCustId,
       given_name: firstName,
       family_name: lastName,
     };
 
-    // Create Outseta account
     const outsetaPerson = await findOrCreateOutsetaUser(userData);
-
-    // Generate Outseta token
     const outsetaToken = await generateOutsetaToken(outsetaPerson.Email);
 
-    if (!oauthData.clientState) {
-      console.error('Missing clientState in temp token payload');
-      return res.status(400).json({ error: 'Invalid session. Please start the sign in again.' });
-    }
-
-    storeTokenForClient(oauthData.clientState, outsetaToken);
-    return res.status(200).json({ success: true });
+    return res.status(200).json({ 
+      success: true, 
+      outsetaToken,
+      returnUrl: oauthData.returnUrl 
+    });
   } catch (err) {
     dumpError('[iRacingSSO] complete-registration', err);
     return res.status(500).json({ error: 'Unable to complete registration' });
   }
-}
-
-async function handlePoll(req, res) {
-  const clientState = req.query.clientState;
-
-  if (!clientState) {
-    return res.status(400).json({ error: 'Missing clientState' });
-  }
-
-  const entry = tempDataStore.get(clientState);
-  if (!entry) {
-    return res.json({ success: false, pending: true });
-  }
-
-  if (Date.now() - entry.createdAt > TOKEN_TTL_MS) {
-    tempDataStore.delete(clientState);
-    return res.json({ success: false, pending: true });
-  }
-
-  tempDataStore.delete(clientState);
-  return res.json({ success: true, outsetaToken: entry.token });
 }
 
 async function findExistingUserByIRacingId(iRacingId) {
@@ -379,7 +289,7 @@ async function findOrCreateOutsetaUser(iRacingUser) {
     console.warn('Outseta search failed:', err.message);
   }
 
-  // Try to create new account via /crm/registrations endpoint with free subscription
+  // Create new account
   const createPayload = {
     Name: `${firstName} ${lastName}`,
     PersonAccount: [
@@ -418,7 +328,6 @@ async function findOrCreateOutsetaUser(iRacingUser) {
 
     return createResponse.data.PrimaryContact;
   } catch (createErr) {
-    // If account already exists, fetch the actual person record
     if (createErr.response?.status === 400 && createErr.response?.data?.EntityValidationErrors?.[0]?.ValidationErrors?.[0]?.ErrorCode === 'Duplicate') {
       const search = await axios.get(`${apiBase}/crm/people`, {
         headers: authHeader,
@@ -428,8 +337,6 @@ async function findOrCreateOutsetaUser(iRacingUser) {
 
       if (search.data.items && search.data.items.length > 0) {
         const person = search.data.items[0];
-        
-        // Update iRacing fields if needed
         const needsUpdate = person.iRacingId !== desiredFields.iRacingId;
 
         if (needsUpdate) {
@@ -473,7 +380,7 @@ async function generateOutsetaToken(email) {
   return tokenResponse.data.access_token || tokenResponse.data;
 }
 
-function renderSuccessPage() {
+function renderSuccessPage(token, returnUrl) {
   return `<!DOCTYPE html>
 <html>
   <head>
@@ -482,7 +389,14 @@ function renderSuccessPage() {
   </head>
   <body>
     <script>
-      window.close();
+      (function() {
+        const token = ${JSON.stringify(token)};
+        const returnUrl = ${JSON.stringify(returnUrl)};
+        
+        const url = new URL(returnUrl);
+        url.hash = 'iracing_token=' + token;
+        window.location.href = url.toString();
+      })();
     </script>
   </body>
 </html>`;
@@ -499,7 +413,7 @@ function renderRedirectToFramer(framerUrl, tempToken) {
     <script>
       const baseUrl = ${JSON.stringify(framerUrl)};
       const separator = baseUrl.includes('?') ? '&' : '?';
-      window.location.href = baseUrl + separator + 'popup=true#token=' + ${JSON.stringify(tempToken)};
+      window.location.href = baseUrl + separator + 'popup=false#token=' + ${JSON.stringify(tempToken)};
     </script>
   </body>
 </html>`;
@@ -520,7 +434,6 @@ function renderErrorPage(message) {
     <div style="text-align:center;">
       <h1>Sign in failed</h1>
       <p>${message}</p>
-      <button onclick="window.close()" style="padding: 10px 20px;">Close</button>
     </div>
   </body>
 </html>`;
@@ -533,9 +446,6 @@ function getBaseUrl(req) {
 }
 
 function maskClientSecret(secret, identifier) {
-  // iRacing requires client secrets to be masked using SHA-256
-  // https://oauth.iracing.com/oauth2/book/token_endpoint.html
-  // Format: SHA256(secret + normalized_identifier) in base64
   const normalizedId = identifier.trim().toLowerCase();
   const combined = secret + normalizedId;
   const hash = crypto.createHash('sha256').update(combined).digest('base64');

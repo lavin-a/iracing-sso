@@ -1,5 +1,6 @@
 const axios = require('axios');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 
 const allowedOrigins = [
   'https://aware-amount-178968.framer.app',
@@ -10,6 +11,28 @@ const allowedOrigins = [
 
 // In-memory store for PKCE verifiers (in production, use Redis or similar)
 const pkceStore = new Map();
+
+// In-memory store for temporary OAuth data (in production, use Redis or similar)
+const tempDataStore = new Map();
+const TOKEN_TTL_MS = 5 * 60 * 1000;
+
+function storeTokenForClient(clientState, token) {
+  if (!clientState || !token) {
+    return;
+  }
+
+  tempDataStore.set(clientState, {
+    token,
+    createdAt: Date.now(),
+  });
+
+  setTimeout(() => {
+    const entry = tempDataStore.get(clientState);
+    if (entry && Date.now() - entry.createdAt >= TOKEN_TTL_MS) {
+      tempDataStore.delete(clientState);
+    }
+  }, TOKEN_TTL_MS);
+}
 
 module.exports = async (req, res) => {
   const origin = req.headers.origin;
@@ -24,7 +47,16 @@ module.exports = async (req, res) => {
     return res.status(200).end();
   }
 
-  const { code } = req.query;
+  const { code, action } = req.query;
+
+  // Handle complete-registration endpoint (POST)
+  if (req.method === 'POST' && action === 'complete-registration') {
+    return handleCompleteRegistration(req, res);
+  }
+
+  if (req.method === 'GET' && action === 'poll') {
+    return handlePoll(req, res);
+  }
 
   if (!code) {
     return handleStart(req, res);
@@ -38,22 +70,33 @@ function handleStart(req, res) {
     return res.status(500).send('iRacing client ID not configured');
   }
 
+  const clientState = req.query.clientState;
+  if (!clientState) {
+    return res.status(400).send('Missing client state');
+  }
+
   const redirectUri = `${getBaseUrl(req)}/api/auth/iracing`;
 
   // Generate PKCE code_verifier and code_challenge
-  // https://oauth.iracing.com/oauth2/book/pkce_overview.html
   const codeVerifier = crypto.randomBytes(32).toString('base64url');
   const codeChallenge = crypto
     .createHash('sha256')
     .update(codeVerifier)
     .digest('base64url');
 
-  // Generate a state parameter to link the verifier to the callback
-  const state = crypto.randomBytes(16).toString('hex');
-  
-  // Store the verifier for the callback (expires in 10 minutes)
-  pkceStore.set(state, codeVerifier);
-  setTimeout(() => pkceStore.delete(state), 10 * 60 * 1000);
+  // Generate a state parameter that includes both PKCE state and client state
+  const pkceState = crypto.randomBytes(16).toString('hex');
+
+  pkceStore.set(pkceState, {
+    codeVerifier,
+    clientState,
+    createdAt: Date.now(),
+  });
+  setTimeout(() => pkceStore.delete(pkceState), 10 * 60 * 1000);
+
+  const statePayload = Buffer.from(
+    JSON.stringify({ pkce: pkceState, client: clientState })
+  ).toString('base64url');
 
   // Using new OAuth endpoints: https://oauth.iracing.com/oauth2/book/authorize_endpoint.html
   const url =
@@ -64,7 +107,7 @@ function handleStart(req, res) {
     `&scope=iracing.auth` +
     `&code_challenge=${encodeURIComponent(codeChallenge)}` +
     `&code_challenge_method=S256` +
-    `&state=${encodeURIComponent(state)}`;
+    `&state=${encodeURIComponent(statePayload)}`;
 
   res.writeHead(302, { Location: url });
   res.end();
@@ -78,17 +121,36 @@ async function handleCallback(req, res, code) {
 
   try {
     const redirectUri = `${getBaseUrl(req)}/api/auth/iracing`;
-    const state = req.query.state;
+    const rawState = req.query.state;
 
-    // Retrieve the PKCE code_verifier
-    const codeVerifier = pkceStore.get(state);
+    let stateData;
+    try {
+      stateData = JSON.parse(Buffer.from(rawState, 'base64url').toString('utf8'));
+    } catch (err) {
+      console.error('Unable to decode state parameter:', err.message);
+      return res.send(renderErrorPage('Invalid authentication state. Please try again.'));
+    }
+
+    const pkceState = stateData?.pkce;
+    const clientState = stateData?.client;
+
+    const pkceEntry = pkceStore.get(pkceState);
+    const codeVerifier = pkceEntry?.codeVerifier || pkceEntry;
+    const clientStateValue = pkceEntry?.clientState || clientState;
     if (!codeVerifier) {
-      console.error('PKCE verifier not found for state:', state);
+      console.error('PKCE verifier not found for state:', pkceState);
       return res.send(renderErrorPage('Session expired. Please try again.'));
     }
 
-    // Clean up the verifier
-    pkceStore.delete(state);
+    if (!clientStateValue) {
+      console.error('Missing client state during callback');
+      return res.send(renderErrorPage('Session expired. Please try again.'));
+    }
+
+    const clientStateResult = clientStateValue;
+
+    // Clean up the verifier entry
+    pkceStore.delete(pkceState);
 
     // Using new OAuth endpoints: https://oauth.iracing.com/oauth2/book/token_endpoint.html
     // For Authorization Code Grant with PKCE, client_secret is "required only if issued"
@@ -102,7 +164,6 @@ async function handleCallback(req, res, code) {
 
     // If client_secret was issued, mask it with client_id before sending
     if (process.env.IRACING_CLIENT_SECRET) {
-      console.log('Masking client secret with client_id');
       tokenParams.client_secret = maskClientSecret(
         process.env.IRACING_CLIENT_SECRET,
         process.env.IRACING_CLIENT_ID
@@ -127,37 +188,139 @@ async function handleCallback(req, res, code) {
     }
     
     const payload = JSON.parse(Buffer.from(tokenParts[1], 'base64').toString('utf-8'));
-    console.log('iRacing token payload:', payload);
 
-    // Map iRacing token data to expected user format
-    const iRacingUser = {
-      sub: payload.sub || payload.cust_id,
-      email: payload.email,
-      given_name: payload.given_name || payload.first_name,
-      family_name: payload.family_name || payload.last_name,
-      preferred_username: payload.preferred_username || payload.display_name,
-      nickname: payload.nickname || payload.display_name,
-    };
+    // iRacing JWT only provides iracing_cust_id, no username/email
+    const iRacingCustId = String(payload.iracing_cust_id || '');
 
-    console.log('iRacing user:', iRacingUser.email);
+    // Check if user already exists by iRacingId
+    const existingUser = await findExistingUserByIRacingId(iRacingCustId);
+    
+    if (existingUser) {
+      // Existing user - auto-login (just like Discord)
+      const outsetaToken = await generateOutsetaToken(existingUser.Email);
+      storeTokenForClient(clientStateResult, outsetaToken);
+      return res.send(renderSuccessPage());
+    }
 
-    const outsetaPerson = await findOrCreateOutsetaUser(iRacingUser);
-    console.log('Outseta person UID:', outsetaPerson.Uid, 'Account UID:', outsetaPerson.Account?.Uid);
+    // New user - need email (iRacing doesn't provide it)
+    const tempToken = jwt.sign(
+      {
+        iRacingCustId,
+        clientState: clientStateResult,
+        firstName: payload.given_name || payload.first_name || 'iRacing',
+        lastName: payload.family_name || payload.last_name || 'User',
+      },
+      process.env.TEMP_TOKEN_SECRET,
+      { expiresIn: '10m' }
+    );
 
-    const outsetaToken = await generateOutsetaToken(outsetaPerson.Email);
-
-    console.log('[iRacingSSO]', JSON.stringify({
-      email: outsetaPerson.Email,
-      uid: outsetaPerson.Uid,
-      accountUid: outsetaPerson.Account?.Uid || null,
-      iRacingId: iRacingUser.sub || null,
-    }));
-
-    return res.send(renderSuccessPage(outsetaToken));
+    return res.send(renderEmailForm(tempToken));
   } catch (err) {
     dumpError('[iRacingSSO]', err);
     return res.send(renderErrorPage('Unable to complete iRacing sign in.'));
   }
+}
+
+async function handleCompleteRegistration(req, res) {
+  try {
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    const { tempToken, email, name } = body;
+
+    if (!tempToken || !email) {
+      return res.status(400).json({ error: 'Missing tempToken or email' });
+    }
+
+    if (!name || name.trim().length === 0) {
+      return res.status(400).json({ error: 'Name is required' });
+    }
+
+    // Verify and decode the temporary token
+    let oauthData;
+    try {
+      oauthData = jwt.verify(tempToken, process.env.TEMP_TOKEN_SECRET);
+    } catch (err) {
+      console.error('Invalid or expired temp token:', err.message);
+      return res.status(400).json({ error: 'Invalid or expired token. Please try signing in again.' });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+
+    // Split name into first and last name
+    const nameParts = name.trim().split(/\s+/);
+    const firstName = nameParts[0] || 'iRacing';
+    const lastName = nameParts.length > 1 ? nameParts.slice(1).join(' ') : 'User';
+
+    // Create user data object
+    const userData = {
+      email,
+      sub: oauthData.iRacingCustId, // Use customer ID (e.g., 1173000)
+      given_name: firstName,
+      family_name: lastName,
+    };
+
+    // Create Outseta account
+    const outsetaPerson = await findOrCreateOutsetaUser(userData);
+
+    // Generate Outseta token
+    const outsetaToken = await generateOutsetaToken(outsetaPerson.Email);
+
+    if (!oauthData.clientState) {
+      console.error('Missing clientState in temp token payload');
+      return res.status(400).json({ error: 'Invalid session. Please start the sign in again.' });
+    }
+
+    storeTokenForClient(oauthData.clientState, outsetaToken);
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    dumpError('[iRacingSSO] complete-registration', err);
+    return res.status(500).json({ error: 'Unable to complete registration' });
+  }
+}
+
+async function handlePoll(req, res) {
+  const clientState = req.query.clientState;
+
+  if (!clientState) {
+    return res.status(400).json({ error: 'Missing clientState' });
+  }
+
+  const entry = tempDataStore.get(clientState);
+  if (!entry) {
+    return res.json({ success: false, pending: true });
+  }
+
+  if (Date.now() - entry.createdAt > TOKEN_TTL_MS) {
+    tempDataStore.delete(clientState);
+    return res.json({ success: false, pending: true });
+  }
+
+  tempDataStore.delete(clientState);
+  return res.json({ success: true, outsetaToken: entry.token });
+}
+
+async function findExistingUserByIRacingId(iRacingId) {
+  const apiBase = `https://${process.env.OUTSETA_DOMAIN}/api/v1`;
+  const authHeader = { Authorization: `Outseta ${process.env.OUTSETA_API_KEY}:${process.env.OUTSETA_SECRET_KEY}` };
+
+  try {
+    const search = await axios.get(`${apiBase}/crm/people`, {
+      headers: authHeader,
+      params: { iRacingId },
+      timeout: 8000,
+    });
+
+    if (search.data.items && search.data.items.length > 0) {
+      return search.data.items[0];
+    }
+  } catch (err) {
+    console.warn('iRacing ID search failed:', err.message);
+  }
+
+  return null;
 }
 
 async function findOrCreateOutsetaUser(iRacingUser) {
@@ -167,12 +330,12 @@ async function findOrCreateOutsetaUser(iRacingUser) {
   const email = iRacingUser.email;
   const firstName = iRacingUser.given_name || 'iRacing';
   const lastName = iRacingUser.family_name || 'User';
+  const iRacingId = String(iRacingUser.sub || '');
   const desiredFields = {
-    iRacingUsername: iRacingUser.preferred_username || iRacingUser.nickname || '',
-    iRacingId: (iRacingUser.sub || '').toString(),
+    iRacingId,
   };
 
-  // Try to find existing person
+  // Try to find existing person by email
   try {
     const search = await axios.get(`${apiBase}/crm/people`, {
       headers: authHeader,
@@ -182,9 +345,7 @@ async function findOrCreateOutsetaUser(iRacingUser) {
 
     if (search.data.items && search.data.items.length > 0) {
       const person = search.data.items[0];
-      const needsUpdate =
-        person.iRacingUsername !== desiredFields.iRacingUsername ||
-        person.iRacingId !== desiredFields.iRacingId;
+      const needsUpdate = person.iRacingId !== desiredFields.iRacingId;
 
       if (needsUpdate) {
         await axios.put(
@@ -206,10 +367,10 @@ async function findOrCreateOutsetaUser(iRacingUser) {
       return person;
     }
   } catch (err) {
-    console.warn('Outseta search failed, will try to create:', err.message);
+    console.warn('Outseta search failed:', err.message);
   }
 
-  // Use /crm/registrations endpoint with free subscription
+  // Try to create new account via /crm/registrations endpoint with free subscription
   const createPayload = {
     Name: `${firstName} ${lastName}`,
     PersonAccount: [
@@ -233,23 +394,58 @@ async function findOrCreateOutsetaUser(iRacingUser) {
     ],
   };
 
-  console.log('Creating Outseta account via /crm/registrations');
+  try {
+    const createResponse = await axios.post(
+      `${apiBase}/crm/registrations`,
+      createPayload,
+      {
+        headers: {
+          ...authHeader,
+          'Content-Type': 'application/json',
+        },
+        timeout: 8000,
+      }
+    );
 
-  const createResponse = await axios.post(
-    `${apiBase}/crm/registrations`,
-    createPayload,
-    {
-      headers: {
-        ...authHeader,
-        'Content-Type': 'application/json',
-      },
-      timeout: 8000,
+    return createResponse.data.PrimaryContact;
+  } catch (createErr) {
+    // If account already exists, fetch the actual person record
+    if (createErr.response?.status === 400 && createErr.response?.data?.EntityValidationErrors?.[0]?.ValidationErrors?.[0]?.ErrorCode === 'Duplicate') {
+      const search = await axios.get(`${apiBase}/crm/people`, {
+        headers: authHeader,
+        params: { Email: email },
+        timeout: 8000,
+      });
+
+      if (search.data.items && search.data.items.length > 0) {
+        const person = search.data.items[0];
+        
+        // Update iRacing fields if needed
+        const needsUpdate = person.iRacingId !== desiredFields.iRacingId;
+
+        if (needsUpdate) {
+          await axios.put(
+            `${apiBase}/crm/people/${person.Uid}`,
+            {
+              Uid: person.Uid,
+              Email: person.Email,
+              FirstName: person.FirstName,
+              LastName: person.LastName,
+              ...desiredFields,
+            },
+            {
+              headers: { ...authHeader, 'Content-Type': 'application/json' },
+              timeout: 8000,
+            }
+          );
+        }
+
+        return person;
+      }
     }
-  );
-
-  console.log('Account created:', createResponse.data.Uid, 'Person:', createResponse.data.PrimaryContact?.Uid);
-
-  return createResponse.data.PrimaryContact;
+    
+    throw createErr;
+  }
 }
 
 async function generateOutsetaToken(email) {
@@ -268,7 +464,7 @@ async function generateOutsetaToken(email) {
   return tokenResponse.data.access_token || tokenResponse.data;
 }
 
-function renderSuccessPage(token) {
+function renderSuccessPage() {
   return `<!DOCTYPE html>
 <html>
   <head>
@@ -276,23 +472,84 @@ function renderSuccessPage(token) {
     <title>iRacing Sign In</title>
     <style>
       body { margin: 0; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; }
-      button { padding: 12px 24px; background: #c8102e; color: #fff; border: none; border-radius: 8px; cursor: pointer; }
+      p { color: #111; font-size: 18px; }
     </style>
   </head>
   <body>
     <div style="text-align:center;">
-      <h1>Signed in with iRacing</h1>
+      <h1>Sign in complete</h1>
       <p>You can close this window.</p>
-      <button onclick="window.close()">Close</button>
     </div>
     <script>
-      (function() {
-        const token = ${JSON.stringify(token)};
-        if (window.opener) {
-          window.opener.postMessage({ type: 'IRACING_AUTH_SUCCESS', outsetaToken: token }, '*');
+      setTimeout(() => window.close(), 2000);
+    </script>
+  </body>
+</html>`;
+}
+
+function renderEmailForm(tempToken) {
+  return `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Complete iRacing Sign In</title>
+    <style>
+      body { margin: 0; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; }
+      .container { text-align: center; max-width: 400px; padding: 20px; }
+      input { display: block; width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 4px; }
+      button { padding: 12px 24px; background: #000; color: #fff; border: none; border-radius: 8px; cursor: pointer; }
+      button:disabled { opacity: 0.6; }
+      .error { color: #ef4444; margin-top: 10px; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Complete Your Sign In</h1>
+      <p>iRacing doesn't provide email. Please enter yours:</p>
+      <form id="form">
+        <input type="email" id="email" placeholder="Email" required />
+        <input type="text" id="name" placeholder="Full Name" required />
+        <button type="submit" id="btn">Continue</button>
+        <div id="msg"></div>
+      </form>
+    </div>
+    <script>
+      document.getElementById('form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const btn = document.getElementById('btn');
+        const msg = document.getElementById('msg');
+        const email = document.getElementById('email').value.trim();
+        const name = document.getElementById('name').value.trim();
+        
+        btn.disabled = true;
+        btn.textContent = 'Processing...';
+        
+        try {
+          const res = await fetch('?action=complete-registration', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tempToken: ${JSON.stringify(tempToken)}, email, name })
+          });
+          
+          if (!res.ok) throw new Error((await res.json()).error);
+          
+          const data = await res.json();
+          if (!data.success) {
+            throw new Error('Unable to complete registration.');
+          }
+
+          msg.className = '';
+          msg.textContent = 'Sign in complete! You can close this window.';
+          btn.textContent = 'Completed';
+
+          setTimeout(() => window.close(), 2000);
+        } catch (err) {
+          msg.className = 'error';
+          msg.textContent = err.message;
+          btn.disabled = false;
+          btn.textContent = 'Continue';
         }
-        setTimeout(() => window.close(), 1200);
-      })();
+      });
     </script>
   </body>
 </html>`;

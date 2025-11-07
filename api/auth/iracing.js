@@ -21,6 +21,7 @@ const allowedEmailUrls = [
 ];
 const DEFAULT_RETURN_URL = allowedReturnUrls[0];
 const DEFAULT_EMAIL_PAGE_URL = allowedEmailUrls[0];
+const ACCOUNT_CONFLICT_MESSAGE = "This email is already registered. Please sign in using a known method, then link this provider from your account settings.";
 
 const redirectHostAllowlist = new Set([
   ...allowedReturnUrls.map(getHost),
@@ -102,11 +103,38 @@ async function handleStart(req, res) {
     return res.status(500).send('iRacing client ID not configured');
   }
 
+  const intent = (req.query.intent || 'login').toLowerCase();
+  if (!['login', 'link'].includes(intent)) {
+    return res.status(400).send('Invalid intent');
+  }
+
   const requestedReturnUrl = req.query.return_url;
   const requestedEmailPageUrl = req.query.email_page_url;
 
   const returnUrl = sanitizeRedirect(requestedReturnUrl, DEFAULT_RETURN_URL);
   const emailPageUrl = sanitizeRedirect(requestedEmailPageUrl, DEFAULT_EMAIL_PAGE_URL);
+
+  let linkPersonUid = null;
+  if (intent === 'link') {
+    const linkToken = req.query.link_token;
+    const requestedLinkUid = req.query.link_person_uid;
+
+    if (!linkToken || !requestedLinkUid) {
+      return res.status(400).send('Missing linking parameters');
+    }
+
+    try {
+      const profile = await verifyOutsetaAccessToken(linkToken);
+      if (profile?.Uid !== requestedLinkUid) {
+        return res.status(403).send('Invalid linking session');
+      }
+    } catch (err) {
+      console.error('Failed to verify Outseta token for linking', err.message);
+      return res.status(403).send('Invalid linking session');
+    }
+
+    linkPersonUid = requestedLinkUid;
+  }
 
   const redirectUri = `${getBaseUrl(req)}/api/auth/iracing`;
 
@@ -124,6 +152,8 @@ async function handleStart(req, res) {
     codeVerifier,
     returnUrl,
     emailPageUrl,
+    intent,
+    linkPersonUid,
     createdAt: Date.now(),
   }, { ex: 600 });
 
@@ -152,18 +182,18 @@ async function handleCallback(req, res, code) {
     const redirectUri = `${getBaseUrl(req)}/api/auth/iracing`;
     const pkceState = req.query.state;
 
-    // Retrieve from Vercel KV
     const pkceEntry = await kv.get(`iracing:pkce:${pkceState}`);
     const codeVerifier = pkceEntry?.codeVerifier;
     const returnUrl = pkceEntry?.returnUrl;
     const emailPageUrl = pkceEntry?.emailPageUrl;
-    
+    const intent = (pkceEntry?.intent || 'login').toLowerCase();
+    const linkPersonUid = pkceEntry?.linkPersonUid || null;
+
     if (!codeVerifier || !returnUrl) {
       console.error('PKCE verifier not found for state:', pkceState);
       return res.send(renderErrorPage('Session expired. Please try again.'));
     }
 
-    // Delete from KV after use
     await kv.del(`iracing:pkce:${pkceState}`);
 
     const tokenParams = {
@@ -196,35 +226,100 @@ async function handleCallback(req, res, code) {
     if (tokenParts.length !== 3) {
       throw new Error('Invalid JWT token format');
     }
-    
+
     const payload = JSON.parse(Buffer.from(tokenParts[1], 'base64').toString('utf-8'));
     const iRacingCustId = String(payload.iracing_cust_id || '');
+    const displayName =
+      payload.display_name ||
+      payload.preferred_username ||
+      payload.iracing_username ||
+      payload.username ||
+      '';
+    const firstName =
+      payload.given_name ||
+      payload.first_name ||
+      (displayName ? displayName.split(' ')[0] : 'iRacing');
+    const lastName =
+      payload.family_name ||
+      payload.last_name ||
+      (displayName ? displayName.split(' ').slice(1).join(' ') || 'User' : 'User');
+    const normalizedEmail = payload.email ? String(payload.email).trim().toLowerCase() : null;
 
-    // Check if user already exists by iRacingId
-    const existingUser = await findExistingUserByIRacingId(iRacingCustId);
-    
-    if (existingUser) {
-      // Existing user - auto-login
-      const outsetaToken = await generateOutsetaToken(existingUser.Email);
+    const existingByiRacingId = iRacingCustId
+      ? await findPersonByField('iRacingId', iRacingCustId)
+      : null;
+
+    if (existingByiRacingId) {
+      if (intent === 'link') {
+        if (!linkPersonUid || existingByiRacingId.Uid !== linkPersonUid) {
+          return res.send(
+            renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE)
+          );
+        }
+
+        return res.send(renderLinkSuccessPage(returnUrl, 'iracing'));
+      }
+
+      const outsetaToken = await generateOutsetaToken(existingByiRacingId.Email);
       return res.send(renderSuccessPage(outsetaToken, returnUrl));
     }
 
-    // New user - need email
+    if (intent === 'link') {
+      if (!linkPersonUid) {
+        return res.send(renderErrorPage('Linking session expired.'));
+      }
+
+      const person = await getPersonByUid(linkPersonUid);
+      if (!person) {
+        return res.send(renderErrorPage('Unable to locate your account.'));
+      }
+
+      await updatePerson(linkPersonUid, {
+        Uid: person.Uid,
+        Email: person.Email,
+        FirstName: person.FirstName,
+        LastName: person.LastName,
+        iRacingId: iRacingCustId,
+        iRacingUsername: displayName || person.iRacingUsername || '',
+      });
+
+      return res.send(renderLinkSuccessPage(returnUrl, 'iracing'));
+    }
+
+    if (normalizedEmail) {
+      const existingByEmail = await findPersonByEmail(normalizedEmail);
+      if (existingByEmail) {
+        return res.send(
+          renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE)
+        );
+      }
+
+      const createdPerson = await createIracingOutsetaUser({
+        email: normalizedEmail,
+        firstName,
+        lastName,
+        iRacingCustId,
+        displayName,
+      });
+      const outsetaToken = await generateOutsetaToken(createdPerson.Email);
+      return res.send(renderSuccessPage(outsetaToken, returnUrl));
+    }
+
     const csrfToken = crypto.randomBytes(16).toString('hex');
     const tempToken = jwt.sign(
       {
         iRacingCustId,
         returnUrl,
         provider: 'iracing',
-        firstName: payload.given_name || payload.first_name || 'iRacing',
-        lastName: payload.family_name || payload.last_name || 'User',
+        firstName,
+        lastName,
+        displayName,
         csrf: csrfToken,
       },
       process.env.TEMP_TOKEN_SECRET,
       { expiresIn: '10m' }
     );
 
-    // Redirect to Framer email collection page
     return res.send(renderRedirectToFramer(emailPageUrl, tempToken));
   } catch (err) {
     dumpError('[iRacingSSO]', err);
@@ -284,24 +379,45 @@ async function handleCompleteRegistration(req, res) {
       return res.status(400).json({ error: 'Invalid characters in input' });
     }
 
+    if (!oauthData.iRacingCustId) {
+      return res.status(400).json({ error: 'Missing iRacing identifier. Please restart sign in.' });
+    }
+
+    const existingByEmail = await findPersonByEmail(sanitizedEmail);
+    if (existingByEmail) {
+      if (
+        existingByEmail.iRacingId &&
+        String(existingByEmail.iRacingId) === String(oauthData.iRacingCustId)
+      ) {
+        const outsetaToken = await generateOutsetaToken(existingByEmail.Email);
+        return res.status(200).json({
+          success: true,
+          outsetaToken,
+          returnUrl: oauthData.returnUrl,
+        });
+      }
+
+      return res.status(409).json({ error: ACCOUNT_CONFLICT_MESSAGE });
+    }
+
     const nameParts = sanitizedName.split(/\s+/);
     const firstName = nameParts[0] || 'iRacing';
     const lastName = nameParts.length > 1 ? nameParts.slice(1).join(' ') : 'User';
+    const displayName = oauthData.displayName || sanitizedName;
 
-    const userData = {
+    const createdPerson = await createIracingOutsetaUser({
       email: sanitizedEmail,
-      sub: oauthData.iRacingCustId,
-      given_name: firstName,
-      family_name: lastName,
-    };
+      firstName,
+      lastName,
+      iRacingCustId: oauthData.iRacingCustId,
+      displayName,
+    });
+    const outsetaToken = await generateOutsetaToken(createdPerson.Email);
 
-    const outsetaPerson = await findOrCreateOutsetaUser(userData);
-    const outsetaToken = await generateOutsetaToken(outsetaPerson.Email);
-
-    return res.status(200).json({ 
-      success: true, 
+    return res.status(200).json({
+      success: true,
       outsetaToken,
-      returnUrl: oauthData.returnUrl 
+      returnUrl: oauthData.returnUrl,
     });
   } catch (err) {
     dumpError('[iRacingSSO] complete-registration', err);
@@ -309,77 +425,10 @@ async function handleCompleteRegistration(req, res) {
   }
 }
 
-async function findExistingUserByIRacingId(iRacingId) {
-  const apiBase = `https://${process.env.OUTSETA_DOMAIN}/api/v1`;
-  const authHeader = { Authorization: `Outseta ${process.env.OUTSETA_API_KEY}:${process.env.OUTSETA_SECRET_KEY}` };
-
-  try {
-    const search = await axios.get(`${apiBase}/crm/people`, {
-      headers: authHeader,
-      params: { iRacingId },
-      timeout: 8000,
-    });
-
-    if (search.data.items && search.data.items.length > 0) {
-      return search.data.items[0];
-    }
-  } catch (err) {
-    console.warn('iRacing ID search failed:', err.message);
-  }
-
-  return null;
-}
-
-async function findOrCreateOutsetaUser(iRacingUser) {
-  const apiBase = `https://${process.env.OUTSETA_DOMAIN}/api/v1`;
-  const authHeader = { Authorization: `Outseta ${process.env.OUTSETA_API_KEY}:${process.env.OUTSETA_SECRET_KEY}` };
-
-  const email = iRacingUser.email;
-  const firstName = iRacingUser.given_name || 'iRacing';
-  const lastName = iRacingUser.family_name || 'User';
-  const iRacingId = String(iRacingUser.sub || '');
-  const desiredFields = {
-    iRacingId,
-  };
-
-  // Try to find existing person by email
-  try {
-    const search = await axios.get(`${apiBase}/crm/people`, {
-      headers: authHeader,
-      params: { Email: email },
-      timeout: 8000,
-    });
-
-    if (search.data.items && search.data.items.length > 0) {
-      const person = search.data.items[0];
-      const needsUpdate = person.iRacingId !== desiredFields.iRacingId;
-
-      if (needsUpdate) {
-        await axios.put(
-          `${apiBase}/crm/people/${person.Uid}`,
-          {
-            Uid: person.Uid,
-            Email: person.Email,
-            FirstName: person.FirstName,
-            LastName: person.LastName,
-            ...desiredFields,
-          },
-          {
-            headers: { ...authHeader, 'Content-Type': 'application/json' },
-            timeout: 8000,
-          }
-        );
-      }
-
-      return person;
-    }
-  } catch (err) {
-    console.warn('Outseta search failed:', err.message);
-  }
-
-  // Create new account
-  const createPayload = {
-    Name: `${firstName} ${lastName}`,
+async function createIracingOutsetaUser({ email, firstName, lastName, iRacingCustId, displayName }) {
+  const fullName = `${firstName} ${lastName}`.trim();
+  const registration = await createRegistration({
+    Name: fullName || 'iRacing User',
     PersonAccount: [
       {
         IsPrimary: true,
@@ -387,7 +436,8 @@ async function findOrCreateOutsetaUser(iRacingUser) {
           Email: email,
           FirstName: firstName,
           LastName: lastName,
-          ...desiredFields,
+          iRacingId: iRacingCustId,
+          iRacingUsername: displayName || fullName || 'iRacing User',
         },
       },
     ],
@@ -399,57 +449,9 @@ async function findOrCreateOutsetaUser(iRacingUser) {
         BillingRenewalTerm: 1,
       },
     ],
-  };
+  });
 
-  try {
-    const createResponse = await axios.post(
-      `${apiBase}/crm/registrations`,
-      createPayload,
-      {
-        headers: {
-          ...authHeader,
-          'Content-Type': 'application/json',
-        },
-        timeout: 8000,
-      }
-    );
-
-    return createResponse.data.PrimaryContact;
-  } catch (createErr) {
-    if (createErr.response?.status === 400 && createErr.response?.data?.EntityValidationErrors?.[0]?.ValidationErrors?.[0]?.ErrorCode === 'Duplicate') {
-      const search = await axios.get(`${apiBase}/crm/people`, {
-        headers: authHeader,
-        params: { Email: email },
-        timeout: 8000,
-      });
-
-      if (search.data.items && search.data.items.length > 0) {
-        const person = search.data.items[0];
-        const needsUpdate = person.iRacingId !== desiredFields.iRacingId;
-
-        if (needsUpdate) {
-          await axios.put(
-            `${apiBase}/crm/people/${person.Uid}`,
-            {
-              Uid: person.Uid,
-              Email: person.Email,
-              FirstName: person.FirstName,
-              LastName: person.LastName,
-              ...desiredFields,
-            },
-            {
-              headers: { ...authHeader, 'Content-Type': 'application/json' },
-              timeout: 8000,
-            }
-          );
-        }
-
-        return person;
-      }
-    }
-    
-    throw createErr;
-  }
+  return registration.PrimaryContact;
 }
 
 async function generateOutsetaToken(email) {
@@ -485,6 +487,50 @@ function renderSuccessPage(token, returnUrl) {
         url.hash = 'iracing_token=' + token;
         window.location.href = url.toString();
       })();
+    </script>
+  </body>
+</html>`;
+}
+
+function renderRedirectWithError(returnUrl, code, message) {
+  const url = new URL(returnUrl);
+  const params = new URLSearchParams(url.hash?.replace(/^#/, '') || '');
+  params.set('error', code);
+  if (message) {
+    params.set('message', message);
+  }
+  url.hash = params.toString();
+
+  return `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Redirecting...</title>
+  </head>
+  <body>
+    <script>
+      window.location.href = ${JSON.stringify(url.toString())};
+    </script>
+  </body>
+</html>`;
+}
+
+function renderLinkSuccessPage(returnUrl, provider) {
+  const url = new URL(returnUrl);
+  const params = new URLSearchParams(url.hash?.replace(/^#/, '') || '');
+  params.set('link', 'success');
+  params.set('provider', provider);
+  url.hash = params.toString();
+
+  return `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Link Successful</title>
+  </head>
+  <body>
+    <script>
+      window.location.href = ${JSON.stringify(url.toString())};
     </script>
   </body>
 </html>`;
@@ -538,6 +584,99 @@ function maskClientSecret(secret, identifier) {
   const combined = secret + normalizedId;
   const hash = crypto.createHash('sha256').update(combined).digest('base64');
   return hash;
+}
+
+function getOutsetaApiBase() {
+  if (!process.env.OUTSETA_DOMAIN) {
+    throw new Error('OUTSETA_DOMAIN not configured');
+  }
+  return `https://${process.env.OUTSETA_DOMAIN}/api/v1`;
+}
+
+function getOutsetaAuthHeaders() {
+  if (!process.env.OUTSETA_API_KEY || !process.env.OUTSETA_SECRET_KEY) {
+    throw new Error('Outseta API credentials not configured');
+  }
+
+  return {
+    Authorization: `Outseta ${process.env.OUTSETA_API_KEY}:${process.env.OUTSETA_SECRET_KEY}`,
+    'Content-Type': 'application/json',
+  };
+}
+
+async function verifyOutsetaAccessToken(token) {
+  if (!token) {
+    throw new Error('Missing Outseta access token');
+  }
+
+  const apiBase = getOutsetaApiBase();
+
+  const response = await axios.get(`${apiBase}/profile`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+    timeout: 8000,
+  });
+
+  return response.data;
+}
+
+async function getPersonByUid(uid) {
+  if (!uid) return null;
+
+  const apiBase = getOutsetaApiBase();
+  const response = await axios.get(`${apiBase}/crm/people/${uid}`, {
+    headers: getOutsetaAuthHeaders(),
+    timeout: 8000,
+  });
+
+  return response.data;
+}
+
+async function findPersonByEmail(email) {
+  if (!email) return null;
+
+  const apiBase = getOutsetaApiBase();
+  const response = await axios.get(`${apiBase}/crm/people`, {
+    headers: getOutsetaAuthHeaders(),
+    params: { Email: email },
+    timeout: 8000,
+  });
+
+  return response.data.items?.[0] ?? null;
+}
+
+async function findPersonByField(field, value) {
+  if (!field || value == null) return null;
+
+  const apiBase = getOutsetaApiBase();
+  const response = await axios.get(`${apiBase}/crm/people`, {
+    headers: getOutsetaAuthHeaders(),
+    params: { [field]: value },
+    timeout: 8000,
+  });
+
+  return response.data.items?.[0] ?? null;
+}
+
+async function updatePerson(uid, payload) {
+  if (!uid) throw new Error('Cannot update person without UID');
+
+  const apiBase = getOutsetaApiBase();
+  await axios.put(`${apiBase}/crm/people/${uid}`, payload, {
+    headers: getOutsetaAuthHeaders(),
+    timeout: 8000,
+  });
+}
+
+async function createRegistration(payload) {
+  const apiBase = getOutsetaApiBase();
+  const response = await axios.post(`${apiBase}/crm/registrations`, payload, {
+    headers: getOutsetaAuthHeaders(),
+    timeout: 8000,
+  });
+
+  return response.data;
 }
 
 function dumpError(tag, error) {

@@ -9,6 +9,54 @@ const allowedOrigins = [
   'https://www.almeidaracingacademy.com',
 ];
 
+const allowedReturnUrls = [
+  'https://aware-amount-178968.framer.app/sign-in',
+  'https://almeidaracingacademy.com/sign-in',
+  'https://www.almeidaracingacademy.com/sign-in',
+];
+const allowedEmailUrls = [
+  'https://aware-amount-178968.framer.app/link-email',
+  'https://almeidaracingacademy.com/link-email',
+  'https://www.almeidaracingacademy.com/link-email',
+];
+const DEFAULT_RETURN_URL = allowedReturnUrls[0];
+const DEFAULT_EMAIL_PAGE_URL = allowedEmailUrls[0];
+
+const redirectHostAllowlist = new Set([
+  ...allowedReturnUrls.map(getHost),
+  ...allowedEmailUrls.map(getHost),
+  'almeidaracingacademy.com',
+  'www.almeidaracingacademy.com',
+  'aware-amount-178968.framer.app',
+].filter(Boolean));
+
+function getHost(url) {
+  try {
+    return new URL(url).host;
+  } catch (err) {
+    return null;
+  }
+}
+
+function sanitizeRedirect(targetUrl, fallbackUrl) {
+  if (!targetUrl) return fallbackUrl;
+  try {
+    const parsed = new URL(targetUrl);
+    if (parsed.protocol !== 'https:') {
+      return fallbackUrl;
+    }
+    if (allowedReturnUrls.includes(parsed.toString()) || allowedEmailUrls.includes(parsed.toString())) {
+      return parsed.toString();
+    }
+    if (redirectHostAllowlist.has(parsed.host)) {
+      return parsed.toString();
+    }
+  } catch (err) {
+    return fallbackUrl;
+  }
+  return fallbackUrl;
+}
+
 // Rate limiting: 10 requests per minute per IP
 async function checkRateLimit(ip) {
   const key = `iracing:ratelimit:${ip}`;
@@ -54,12 +102,11 @@ async function handleStart(req, res) {
     return res.status(500).send('iRacing client ID not configured');
   }
 
-  const returnUrl = req.query.return_url;
-  const emailPageUrl = req.query.email_page_url;
-  
-  if (!returnUrl) {
-    return res.status(400).send('Missing return_url parameter');
-  }
+  const requestedReturnUrl = req.query.return_url;
+  const requestedEmailPageUrl = req.query.email_page_url;
+
+  const returnUrl = sanitizeRedirect(requestedReturnUrl, DEFAULT_RETURN_URL);
+  const emailPageUrl = sanitizeRedirect(requestedEmailPageUrl, DEFAULT_EMAIL_PAGE_URL);
 
   const redirectUri = `${getBaseUrl(req)}/api/auth/iracing`;
 

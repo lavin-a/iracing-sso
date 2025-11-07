@@ -1,20 +1,25 @@
 const axios = require('axios');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
+const { kv } = require('@vercel/kv');
 
 const allowedOrigins = [
   'https://aware-amount-178968.framer.app',
   'https://almeidaracingacademy.com',
   'https://www.almeidaracingacademy.com',
-  'https://almeidaracingacademy.outseta.com',
 ];
 
-// In-memory store for PKCE verifiers (in production, use Redis or similar)
-const pkceStore = new Map();
+// Rate limiting: 10 requests per minute per IP
+async function checkRateLimit(ip) {
+  const key = `iracing:ratelimit:${ip}`;
+  const count = await kv.incr(key);
+  if (count === 1) await kv.expire(key, 60);
+  return count <= 10;
+}
 
 module.exports = async (req, res) => {
   const origin = req.headers.origin;
-  if (allowedOrigins.includes(origin) || origin?.endsWith('.framer.app')) {
+  if (allowedOrigins.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -23,6 +28,12 @@ module.exports = async (req, res) => {
 
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
+  }
+
+  // Rate limiting
+  const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.connection?.remoteAddress || 'unknown';
+  if (!await checkRateLimit(ip)) {
+    return res.status(429).json({ error: 'Too many requests. Please try again later.' });
   }
 
   const { code, action } = req.query;
@@ -38,7 +49,7 @@ module.exports = async (req, res) => {
   return handleCallback(req, res, code);
 };
 
-function handleStart(req, res) {
+async function handleStart(req, res) {
   if (!process.env.IRACING_CLIENT_ID) {
     return res.status(500).send('iRacing client ID not configured');
   }
@@ -61,13 +72,13 @@ function handleStart(req, res) {
 
   const pkceState = crypto.randomBytes(16).toString('hex');
 
-  pkceStore.set(pkceState, {
+  // Store in Vercel KV with 10 minute expiration
+  await kv.set(`iracing:pkce:${pkceState}`, {
     codeVerifier,
     returnUrl,
     emailPageUrl,
     createdAt: Date.now(),
-  });
-  setTimeout(() => pkceStore.delete(pkceState), 10 * 60 * 1000);
+  }, { ex: 600 });
 
   const url =
     'https://oauth.iracing.com/oauth2/authorize' +
@@ -94,7 +105,8 @@ async function handleCallback(req, res, code) {
     const redirectUri = `${getBaseUrl(req)}/api/auth/iracing`;
     const pkceState = req.query.state;
 
-    const pkceEntry = pkceStore.get(pkceState);
+    // Retrieve from Vercel KV
+    const pkceEntry = await kv.get(`iracing:pkce:${pkceState}`);
     const codeVerifier = pkceEntry?.codeVerifier;
     const returnUrl = pkceEntry?.returnUrl;
     const emailPageUrl = pkceEntry?.emailPageUrl;
@@ -104,7 +116,8 @@ async function handleCallback(req, res, code) {
       return res.send(renderErrorPage('Session expired. Please try again.'));
     }
 
-    pkceStore.delete(pkceState);
+    // Delete from KV after use
+    await kv.del(`iracing:pkce:${pkceState}`);
 
     const tokenParams = {
       grant_type: 'authorization_code',
@@ -150,6 +163,7 @@ async function handleCallback(req, res, code) {
     }
 
     // New user - need email
+    const csrfToken = crypto.randomBytes(16).toString('hex');
     const tempToken = jwt.sign(
       {
         iRacingCustId,
@@ -157,6 +171,7 @@ async function handleCallback(req, res, code) {
         provider: 'iracing',
         firstName: payload.given_name || payload.first_name || 'iRacing',
         lastName: payload.family_name || payload.last_name || 'User',
+        csrf: csrfToken,
       },
       process.env.TEMP_TOKEN_SECRET,
       { expiresIn: '10m' }
@@ -173,7 +188,7 @@ async function handleCallback(req, res, code) {
 async function handleCompleteRegistration(req, res) {
   try {
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
-    const { tempToken, email, name } = body;
+    const { tempToken, email, name, csrf } = body;
 
     if (!tempToken || !email) {
       return res.status(400).json({ error: 'Missing tempToken or email' });
@@ -191,17 +206,43 @@ async function handleCompleteRegistration(req, res) {
       return res.status(400).json({ error: 'Invalid or expired token. Please try signing in again.' });
     }
 
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-      return res.status(400).json({ error: 'Invalid email format' });
+    // CSRF protection
+    if (!csrf || oauthData.csrf !== csrf) {
+      console.error('CSRF token mismatch');
+      return res.status(403).json({ error: 'Invalid request. Please try again.' });
     }
 
-    const nameParts = name.trim().split(/\s+/);
+    // Validate and sanitize email
+    const sanitizedEmail = email.trim().toLowerCase();
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(sanitizedEmail)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+    if (sanitizedEmail.length > 254) {
+      return res.status(400).json({ error: 'Email address is too long' });
+    }
+
+    // Validate and sanitize name
+    const sanitizedName = name.trim().replace(/\s+/g, ' '); // Normalize whitespace
+    if (sanitizedName.length < 2) {
+      return res.status(400).json({ error: 'Name must be at least 2 characters' });
+    }
+    if (sanitizedName.length > 100) {
+      return res.status(400).json({ error: 'Name must be less than 100 characters' });
+    }
+
+    // Prevent malicious input
+    const dangerousPattern = /<|>|javascript:|on\w+=/i;
+    if (dangerousPattern.test(sanitizedName) || dangerousPattern.test(sanitizedEmail)) {
+      return res.status(400).json({ error: 'Invalid characters in input' });
+    }
+
+    const nameParts = sanitizedName.split(/\s+/);
     const firstName = nameParts[0] || 'iRacing';
     const lastName = nameParts.length > 1 ? nameParts.slice(1).join(' ') : 'User';
 
     const userData = {
-      email,
+      email: sanitizedEmail,
       sub: oauthData.iRacingCustId,
       given_name: firstName,
       family_name: lastName,

@@ -107,7 +107,8 @@ function handleStart(req, res) {
     `&scope=iracing.auth` +
     `&code_challenge=${encodeURIComponent(codeChallenge)}` +
     `&code_challenge_method=S256` +
-    `&state=${encodeURIComponent(statePayload)}`;
+    `&state=${encodeURIComponent(statePayload)}` +
+    `&prompt=none`;
 
   res.writeHead(302, { Location: url });
   res.end();
@@ -469,19 +470,11 @@ function renderSuccessPage() {
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>iRacing Sign In</title>
-    <style>
-      body { margin: 0; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; }
-      p { color: #111; font-size: 18px; }
-    </style>
+    <title>Signing in...</title>
   </head>
   <body>
-    <div style="text-align:center;">
-      <h1>Sign in complete</h1>
-      <p>You can close this window.</p>
-    </div>
     <script>
-      setTimeout(() => window.close(), 2000);
+      window.close();
     </script>
   </body>
 </html>`;
@@ -538,11 +531,7 @@ function renderEmailForm(tempToken) {
             throw new Error('Unable to complete registration.');
           }
 
-          msg.className = '';
-          msg.textContent = 'Sign in complete! You can close this window.';
-          btn.textContent = 'Completed';
-
-          setTimeout(() => window.close(), 2000);
+          window.close();
         } catch (err) {
           msg.className = 'error';
           msg.textContent = err.message;

@@ -71,6 +71,8 @@ function handleStart(req, res) {
   }
 
   const clientState = req.query.clientState;
+  const emailPageUrl = req.query.emailPageUrl;
+  
   if (!clientState) {
     return res.status(400).send('Missing client state');
   }
@@ -90,6 +92,7 @@ function handleStart(req, res) {
   pkceStore.set(pkceState, {
     codeVerifier,
     clientState,
+    emailPageUrl,
     createdAt: Date.now(),
   });
   setTimeout(() => pkceStore.delete(pkceState), 10 * 60 * 1000);
@@ -138,6 +141,8 @@ async function handleCallback(req, res, code) {
     const pkceEntry = pkceStore.get(pkceState);
     const codeVerifier = pkceEntry?.codeVerifier || pkceEntry;
     const clientStateValue = pkceEntry?.clientState || clientState;
+    const emailPageUrl = pkceEntry?.emailPageUrl;
+    
     if (!codeVerifier) {
       console.error('PKCE verifier not found for state:', pkceState);
       return res.send(renderErrorPage('Session expired. Please try again.'));
@@ -208,6 +213,7 @@ async function handleCallback(req, res, code) {
       {
         iRacingCustId,
         clientState: clientStateResult,
+        provider: 'iracing',
         firstName: payload.given_name || payload.first_name || 'iRacing',
         lastName: payload.family_name || payload.last_name || 'User',
       },
@@ -215,7 +221,9 @@ async function handleCallback(req, res, code) {
       { expiresIn: '10m' }
     );
 
-    return res.send(renderEmailForm(tempToken));
+    // Redirect to Framer page for email collection
+    const framerEmailPage = emailPageUrl;
+    return res.send(renderRedirectToFramer(framerEmailPage, tempToken));
   } catch (err) {
     dumpError('[iRacingSSO]', err);
     return res.send(renderErrorPage('Unable to complete iRacing sign in.'));
@@ -480,65 +488,18 @@ function renderSuccessPage() {
 </html>`;
 }
 
-function renderEmailForm(tempToken) {
+function renderRedirectToFramer(framerUrl, tempToken) {
   return `<!DOCTYPE html>
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>Complete iRacing Sign In</title>
-    <style>
-      body { margin: 0; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; }
-      .container { text-align: center; max-width: 400px; padding: 20px; }
-      input { display: block; width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 4px; }
-      button { padding: 12px 24px; background: #000; color: #fff; border: none; border-radius: 8px; cursor: pointer; }
-      button:disabled { opacity: 0.6; }
-      .error { color: #ef4444; margin-top: 10px; }
-    </style>
+    <title>Redirecting...</title>
   </head>
   <body>
-    <div class="container">
-      <h1>Complete Your Sign In</h1>
-      <p>iRacing doesn't provide email. Please enter yours:</p>
-      <form id="form">
-        <input type="email" id="email" placeholder="Email" required />
-        <input type="text" id="name" placeholder="Full Name" required />
-        <button type="submit" id="btn">Continue</button>
-        <div id="msg"></div>
-      </form>
-    </div>
     <script>
-      document.getElementById('form').addEventListener('submit', async (e) => {
-        e.preventDefault();
-        const btn = document.getElementById('btn');
-        const msg = document.getElementById('msg');
-        const email = document.getElementById('email').value.trim();
-        const name = document.getElementById('name').value.trim();
-        
-        btn.disabled = true;
-        btn.textContent = 'Processing...';
-        
-        try {
-          const res = await fetch('?action=complete-registration', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ tempToken: ${JSON.stringify(tempToken)}, email, name })
-          });
-          
-          if (!res.ok) throw new Error((await res.json()).error);
-          
-          const data = await res.json();
-          if (!data.success) {
-            throw new Error('Unable to complete registration.');
-          }
-
-          window.close();
-        } catch (err) {
-          msg.className = 'error';
-          msg.textContent = err.message;
-          btn.disabled = false;
-          btn.textContent = 'Continue';
-        }
-      });
+      const baseUrl = ${JSON.stringify(framerUrl)};
+      const separator = baseUrl.includes('?') ? '&' : '?';
+      window.location.href = baseUrl + separator + 'popup=true#token=' + ${JSON.stringify(tempToken)};
     </script>
   </body>
 </html>`;

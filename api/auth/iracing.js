@@ -11,8 +11,11 @@ const allowedOrigins = [
 
 const allowedReturnUrls = [
   'https://aware-amount-178968.framer.app/sign-in',
+  'https://aware-amount-178968.framer.app/account',
   'https://almeidaracingacademy.com/sign-in',
+  'https://almeidaracingacademy.com/account',
   'https://www.almeidaracingacademy.com/sign-in',
+  'https://www.almeidaracingacademy.com/account',
 ];
 const allowedEmailUrls = [
   'https://aware-amount-178968.framer.app/link-email',

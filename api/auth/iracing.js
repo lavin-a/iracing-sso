@@ -256,7 +256,7 @@ async function handleCallback(req, res, code) {
       if (intent === 'link') {
         if (!linkPersonUid || existingByiRacingId.Uid !== linkPersonUid) {
           return res.send(
-            renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE)
+            renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE, 'iracing')
           );
         }
 
@@ -293,7 +293,7 @@ async function handleCallback(req, res, code) {
       const existingByEmail = await findPersonByEmail(normalizedEmail);
       if (existingByEmail) {
         return res.send(
-          renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE)
+          renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE, 'iracing')
         );
       }
 
@@ -495,12 +495,15 @@ function renderSuccessPage(token, returnUrl) {
 </html>`;
 }
 
-function renderRedirectWithError(returnUrl, code, message) {
+function renderRedirectWithError(returnUrl, code, message, provider) {
   const url = new URL(returnUrl);
   const params = new URLSearchParams(url.hash?.replace(/^#/, '') || '');
   params.set('error', code);
   if (message) {
     params.set('message', message);
+  }
+  if (provider) {
+    params.set('provider', provider);
   }
   url.hash = params.toString();
 

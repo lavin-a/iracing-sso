@@ -7,6 +7,7 @@ const allowedOrigins = [
   'https://aware-amount-178968.framer.app',
   'https://almeidaracingacademy.com',
   'https://www.almeidaracingacademy.com',
+  'https://new.almeidaracingacademy.com',
 ];
 
 const allowedReturnUrls = [
@@ -16,11 +17,14 @@ const allowedReturnUrls = [
   'https://almeidaracingacademy.com/account',
   'https://www.almeidaracingacademy.com/sign-in',
   'https://www.almeidaracingacademy.com/account',
+  'https://new.almeidaracingacademy.com/sign-in',
+  'https://new.almeidaracingacademy.com/account',
 ];
 const allowedEmailUrls = [
   'https://aware-amount-178968.framer.app/link-email',
   'https://almeidaracingacademy.com/link-email',
   'https://www.almeidaracingacademy.com/link-email',
+  'https://new.almeidaracingacademy.com/link-email',
 ];
 const DEFAULT_RETURN_URL = allowedReturnUrls[0];
 const DEFAULT_EMAIL_PAGE_URL = allowedEmailUrls[0];

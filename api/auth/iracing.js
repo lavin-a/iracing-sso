@@ -4,26 +4,19 @@ const jwt = require('jsonwebtoken');
 const { kv } = require('@vercel/kv');
 
 const allowedOrigins = [
-  'https://aware-amount-178968.framer.app',
   'https://almeidaracingacademy.com',
-  'https://www.almeidaracingacademy.com',
+  'https://aware-amount-178968.framer.app',
   'https://new.almeidaracingacademy.com',
 ];
 
 const allowedReturnUrls = [
-  'https://aware-amount-178968.framer.app/sign-in',
-  'https://aware-amount-178968.framer.app/account',
-  'https://almeidaracingacademy.com/sign-in',
-  'https://almeidaracingacademy.com/account',
-  'https://www.almeidaracingacademy.com/sign-in',
-  'https://www.almeidaracingacademy.com/account',
-  'https://new.almeidaracingacademy.com/sign-in',
-  'https://new.almeidaracingacademy.com/account',
+  'https://almeidaracingacademy.com/success',
+  'https://aware-amount-178968.framer.app/success',
+  'https://new.almeidaracingacademy.com/success',
 ];
 const allowedEmailUrls = [
-  'https://aware-amount-178968.framer.app/link-email',
   'https://almeidaracingacademy.com/link-email',
-  'https://www.almeidaracingacademy.com/link-email',
+  'https://aware-amount-178968.framer.app/link-email',
   'https://new.almeidaracingacademy.com/link-email',
 ];
 const DEFAULT_RETURN_URL = allowedReturnUrls[0];
@@ -34,8 +27,8 @@ const redirectHostAllowlist = new Set([
   ...allowedReturnUrls.map(getHost),
   ...allowedEmailUrls.map(getHost),
   'almeidaracingacademy.com',
-  'www.almeidaracingacademy.com',
   'aware-amount-178968.framer.app',
+  'new.almeidaracingacademy.com',
 ].filter(Boolean));
 
 function getHost(url) {

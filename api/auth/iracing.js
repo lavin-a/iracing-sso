@@ -297,6 +297,20 @@ async function handleCallback(req, res, code) {
     if (normalizedEmail) {
       const existingByEmail = await findPersonByEmail(normalizedEmail);
       if (existingByEmail) {
+        const existingIracingId = existingByEmail.iRacingId
+          ? String(existingByEmail.iRacingId).trim()
+          : null;
+        const incomingIracingId = iRacingCustId ? String(iRacingCustId).trim() : null;
+
+        const idMatches =
+          !existingIracingId || (incomingIracingId && existingIracingId === incomingIracingId);
+
+        if (!idMatches) {
+          return res.send(
+            renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE, 'iracing')
+          );
+        }
+
         const hasAccount = personHasAccount(existingByEmail);
         if (!hasAccount) {
           const ensured = await ensurePersonHasAccount(existingByEmail.Email, existingByEmail);
@@ -409,16 +423,32 @@ async function handleCompleteRegistration(req, res) {
 
     const existingByEmail = await findPersonByEmail(sanitizedEmail);
     if (existingByEmail) {
-      if (
-        existingByEmail.iRacingId &&
-        String(existingByEmail.iRacingId) === String(oauthData.iRacingCustId)
-      ) {
-        const outsetaToken = await generateOutsetaToken(existingByEmail.Email);
-        return res.status(200).json({
-          success: true,
-          outsetaToken,
-          returnUrl: oauthData.returnUrl,
-        });
+      const existingIracingId = existingByEmail.iRacingId
+        ? String(existingByEmail.iRacingId)
+        : null;
+      const matches =
+        !existingIracingId ||
+        String(existingIracingId) === String(oauthData.iRacingCustId);
+
+      if (matches && !personHasAccount(existingByEmail)) {
+        const ensured = await ensurePersonHasAccount(existingByEmail.Email, existingByEmail);
+        if (ensured) {
+          await updatePerson(existingByEmail.Uid, {
+            Uid: existingByEmail.Uid,
+            Email: existingByEmail.Email,
+            FirstName: existingByEmail.FirstName,
+            LastName: existingByEmail.LastName,
+            iRacingId: oauthData.iRacingCustId,
+            iRacingUsername: oauthData.displayName || sanitizedName,
+          });
+
+          const outsetaToken = await generateOutsetaToken(existingByEmail.Email);
+          return res.status(200).json({
+            success: true,
+            outsetaToken,
+            returnUrl: oauthData.returnUrl,
+          });
+        }
       }
 
       return res.status(409).json({ error: ACCOUNT_CONFLICT_MESSAGE });

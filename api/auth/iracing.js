@@ -152,6 +152,12 @@ async function handleStart(req, res) {
   const pkceState = crypto.randomBytes(16).toString('hex');
 
   // Store in Vercel KV with 10 minute expiration
+  console.log('[iRacingSSO] storing PKCE state', {
+    key: `iracing:pkce:${pkceState}`,
+    intent,
+    hasReturnUrl: Boolean(returnUrl),
+    createdAt: Date.now(),
+  });
   await kv.set(`iracing:pkce:${pkceState}`, {
     codeVerifier,
     returnUrl,
@@ -185,8 +191,11 @@ async function handleCallback(req, res, code) {
   try {
     const redirectUri = `${getBaseUrl(req)}/api/auth/iracing`;
     const pkceState = req.query.state;
+    const pkceKey = `iracing:pkce:${pkceState}`;
+    const usedKey = `iracing:pkce:used:${pkceState}`;
 
-    const pkceEntry = await kv.get(`iracing:pkce:${pkceState}`);
+    console.log('[iRacingSSO] received PKCE state', { state: pkceState });
+    const pkceEntry = await kv.get(pkceKey);
     const codeVerifier = pkceEntry?.codeVerifier;
     const returnUrl = pkceEntry?.returnUrl;
     const emailPageUrl = pkceEntry?.emailPageUrl;
@@ -194,11 +203,21 @@ async function handleCallback(req, res, code) {
     const linkPersonUid = pkceEntry?.linkPersonUid || null;
 
     if (!codeVerifier || !returnUrl) {
+      const usedData = await kv.get(usedKey);
+      if (usedData?.returnUrl) {
+        if (usedData.mode === 'link') {
+          return res.send(renderLinkSuccessPage(usedData.returnUrl, 'iracing'));
+        }
+        return res.send(renderSuccessPage(usedData.outsetaToken || '', usedData.returnUrl));
+      }
       console.error('PKCE verifier not found for state:', pkceState);
       return res.send(renderErrorPage('Session expired. Please try again.'));
     }
 
-    await kv.del(`iracing:pkce:${pkceState}`);
+    const finalizeSuccess = async (mode, token) => {
+      await kv.set(usedKey, { returnUrl, outsetaToken: token || '', mode }, { ex: 300 });
+      await kv.del(pkceKey);
+    };
 
     const tokenParams = {
       grant_type: 'authorization_code',
@@ -261,10 +280,12 @@ async function handleCallback(req, res, code) {
           );
         }
 
+        await finalizeSuccess('link');
         return res.send(renderLinkSuccessPage(returnUrl, 'iracing'));
       }
 
       const outsetaToken = await generateOutsetaToken(existingByiRacingId.Email);
+      await finalizeSuccess('login', outsetaToken);
       return res.send(renderSuccessPage(outsetaToken, returnUrl));
     }
 
@@ -287,6 +308,7 @@ async function handleCallback(req, res, code) {
         iRacingUsername: displayName || person.iRacingUsername || '',
       });
 
+      await finalizeSuccess('link');
       return res.send(renderLinkSuccessPage(returnUrl, 'iracing'));
     }
 
@@ -320,6 +342,7 @@ async function handleCallback(req, res, code) {
               iRacingUsername: displayName || existingByEmail.iRacingUsername || '',
             });
             const outsetaToken = await generateOutsetaToken(existingByEmail.Email);
+            await finalizeSuccess('login', outsetaToken);
             return res.send(renderSuccessPage(outsetaToken, returnUrl));
           }
         }
@@ -336,6 +359,7 @@ async function handleCallback(req, res, code) {
         displayName,
       });
       const outsetaToken = await generateOutsetaToken(createdPerson.Email);
+      await finalizeSuccess('login', outsetaToken);
       return res.send(renderSuccessPage(outsetaToken, returnUrl));
     }
 
@@ -502,6 +526,11 @@ async function handleSendPasswordReset(req, res) {
     return res.status(200).json({ success: true });
   } catch (err) {
     dumpError('[iRacingSSO][password-reset]', err);
+
+    if (err.status === 401 || err.response?.status === 401) {
+      return res.status(401).json({ error: 'Session expired. Please try again.', code: 'TOKEN_EXPIRED' });
+    }
+
     return res.status(500).json({ error: 'Unable to send password email. Please try again later.' });
   }
 }
@@ -750,7 +779,7 @@ async function findPersonByField(field, value) {
   const response = await axios.get(`${apiBase}/crm/people`, {
     headers: getOutsetaAuthHeaders(),
     params: { [field]: value },
-    timeout: 8000,
+    timeout: 12000,
   });
 
   return response.data.items?.[0] ?? null;
@@ -936,6 +965,11 @@ async function handleDisconnect(req, res) {
     });
   } catch (err) {
     dumpError('[iRacingSSO][disconnect]', err);
+
+    if (err.status === 401 || err.response?.status === 401) {
+      return res.status(401).json({ error: 'Session expired. Please try again.', code: 'TOKEN_EXPIRED' });
+    }
+
     return res.status(500).json({ error: 'Unable to disconnect iRacing at this time.' });
   }
 }

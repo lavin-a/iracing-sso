@@ -51,15 +51,18 @@ const kv = new Redis({
 const allowedOrigins = [
   'https://almeidaracingacademy.com',
   'https://aware-amount-178968.framer.app',
+  'https://events.almeidaracingacademy.com',
 ];
 
 const allowedReturnUrls = [
   'https://almeidaracingacademy.com/success',
   'https://aware-amount-178968.framer.app/success',
+  'https://events.almeidaracingacademy.com/success',
 ];
 const allowedEmailUrls = [
   'https://almeidaracingacademy.com/link-email',
   'https://aware-amount-178968.framer.app/link-email',
+  'https://events.almeidaracingacademy.com/link-email',
 ];
 const DEFAULT_RETURN_URL = allowedReturnUrls[0];
 const DEFAULT_EMAIL_PAGE_URL = allowedEmailUrls[0];
@@ -70,6 +73,7 @@ const redirectHostAllowlist = new Set([
   ...allowedEmailUrls.map(getHost),
   'almeidaracingacademy.com',
   'aware-amount-178968.framer.app',
+  'events.almeidaracingacademy.com',
 ].filter(Boolean));
 
 function getHost(url) {
